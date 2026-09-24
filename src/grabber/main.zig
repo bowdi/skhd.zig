@@ -340,6 +340,14 @@ const Daemon = struct {
     /// capped at vhidd_recovery_backoff_max_ms.
     vhidd_recovery_backoff_ms: u32 = 0,
 
+    /// Pending seize-rebuild retry, non-null while the last rebuild failed
+    /// on a transient seize-open error (e.g. kIOReturnNotReady from a
+    /// device still re-enumerating). Without it nothing re-seizes until the
+    /// next agent reload. One-shot; any successful rebuild cancels it.
+    seize_retry_timer: c.CFRunLoopTimerRef = null,
+    /// Backoff and attempt budget since the last successful rebuild.
+    seize_retry: HidSeize.StartRetry = .{},
+
     /// vhidd heartbeat watchdog. The server heartbeats every connected
     /// client (frame type=0 carrying the next-heartbeat deadline). A
     /// wedged server session — the confirmed mid-session dead-keyboard
@@ -430,6 +438,7 @@ const Daemon = struct {
         self.stopConsoleUserTimer();
         self.stopPostWakeVerify();
         self.cancelVhiddRecoveryTimer();
+        self.cancelSeizeRetry();
         self.stopVhiddWatch();
         self.teardownSeize();
         if (self.vhidd) |v| {
@@ -674,8 +683,23 @@ const Daemon = struct {
     /// subscription's rules. Called whenever the active state
     /// changes: a new agent connected, an existing one disconnected,
     /// or the console user switched. The active subscription's
-    /// stream becomes the layer-push target.
+    /// stream becomes the layer-push target. A transient seize failure
+    /// arms a backoff retry; any success cancels it.
     fn applyLatestRules(self: *Daemon) !void {
+        self.rebuildFromActiveSubscription() catch |err| {
+            // Only seize-open failures retry here: a vhidd connect or
+            // handshake failure waits for the next device change or agent
+            // reload, as before. And while a vhidd recovery is in flight it
+            // reschedules itself on any failure, so a second timer would
+            // only race it.
+            if (HidSeize.isTransientStartError(err) and !self.seize_ctx.vhidd_broken) self.scheduleSeizeRetry();
+            return err;
+        };
+        self.cancelSeizeRetry();
+        self.seize_retry = .{};
+    }
+
+    fn rebuildFromActiveSubscription(self: *Daemon) !void {
         // While the system is asleep the seize must stay torn down: the
         // device is powering down/up and a seize taken across that
         // transition goes stale. onSystemWake re-runs this after clearing
@@ -1094,6 +1118,22 @@ const Daemon = struct {
         disarm(&self.vhidd_recovery_timer);
     }
 
+    fn scheduleSeizeRetry(self: *Daemon) void {
+        const delay_ms = self.seize_retry.next() orelse {
+            log.err("seize rebuild still failing after {d} retries — giving up until the next device change or reload", .{self.seize_retry.attempts});
+            return;
+        };
+        if (!armOneShot(&self.seize_retry_timer, msToSeconds(delay_ms), seizeRetryTimerCallback, self)) {
+            log.err("seize retry timer create failed — re-seize waits for the next reload or device change", .{});
+            return;
+        }
+        log.warn("seize rebuild failed — retrying in {d}ms", .{delay_ms});
+    }
+
+    fn cancelSeizeRetry(self: *Daemon) void {
+        disarm(&self.seize_retry_timer);
+    }
+
     /// Body of the recovery timer callback. Release seize (so real
     /// keystrokes flow to the OS), close the dead client, then run
     /// applyLatestRules (which lazy-connects vhidd and re-seizes).
@@ -1114,7 +1154,7 @@ const Daemon = struct {
         }
         self.applyLatestRules() catch |err| {
             const next = Vhidd.nextBackoffMs(self.vhidd_recovery_backoff_ms);
-            log.warn("vhidd reconnect failed: {s} — retrying in {d}ms", .{ @errorName(err), next });
+            log.warn("rebuild after vhidd recovery failed: {s} — retrying in {d}ms", .{ @errorName(err), next });
             self.vhidd_recovery_backoff_ms = next;
             self.scheduleVhiddRecovery(next);
             return;
@@ -1178,7 +1218,9 @@ fn consoleUserTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(
 fn onDeviceChange(ctx: ?*anyopaque) void {
     const d: *Daemon = @ptrCast(@alignCast(ctx orelse return));
     if (d.sleeping) return; // seize stays released until wake
-    if (d.seize == null) return; // nothing seized yet → first apply_rules will
+    // Gate on wanting a seize, not on having one: a failed rebuild leaves
+    // `seize` null, and a device change is the best moment to retry it.
+    if (d.activeSubscription() == null) return; // no rules yet → first apply_rules will
     // info: routine recovery, fires on every wake/plug — compiled out of
     // ReleaseFast. The FAILURE below stays warn (a real anomaly).
     log.info("keyboard enumeration changed — re-seizing", .{});
@@ -1197,7 +1239,7 @@ fn onDeviceChange(ctx: ?*anyopaque) void {
 fn onRestoreKeyTrigger(ctx: ?*anyopaque) void {
     const d: *Daemon = @ptrCast(@alignCast(ctx orelse return));
     if (d.sleeping) return; // wake path re-seizes anyway
-    if (d.seize == null) return; // nothing seized → nothing to restore
+    if (d.activeSubscription() == null) return; // no rules → nothing to restore
     log.warn("master restore triggered — rebuilding vhidd connection and seize", .{});
     d.markVhiddBroken();
 }
@@ -1294,6 +1336,18 @@ fn vhiddRecoveryTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callcon
     // re-schedule from attemptVhiddRecovery doesn't fight with it.
     disarm(&d.vhidd_recovery_timer);
     d.attemptVhiddRecovery();
+}
+
+fn seizeRetryTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
+    const d: *Daemon = @ptrCast(@alignCast(info orelse return));
+    // One-shot: release before the rebuild, which may re-arm it.
+    disarm(&d.seize_retry_timer);
+    if (d.sleeping) return; // onSystemWake rebuilds
+    if (d.seize_ctx.vhidd_broken) return; // vhidd broke since arming; attemptVhiddRecovery owns the rebuild
+    log.info("retrying seize rebuild", .{});
+    d.applyLatestRules() catch |err| {
+        log.warn("seize retry failed: {s}", .{@errorName(err)});
+    };
 }
 
 /// vhidd watchdog read source: frames arrived on the client socket.
