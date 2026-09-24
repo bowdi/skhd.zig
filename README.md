@@ -35,6 +35,7 @@ skhd.zig now ships a system-level **grabber daemon** that enables remapping the 
 - **`.remap caps_lock [device <alias>] : escape`** — instant 1:1 swap, applied via `hidutil` (no daemon).
 - **`.remap key [device <alias>] { tap: …, hold: …, … }`** — tap vs. hold on the same key (e.g. `caps_lock` tapped = escape, held = control). Routed through `skhd-grabber` (root LaunchDaemon) which seizes the keyboard at the IOKit/HID level via Karabiner DriverKit. Required for caps-lock-class rules and modifier-as-hold rules that `hidutil` silently drops.
 - **Layer holds** — `hold` can target a skhd mode instead of a key, so holding the source key activates the layer for the duration of the hold (e.g. hold `space` to enter `fn_layer`, where `fn_layer < 1 | f1` rebinds the number row to F-keys).
+- **Modifier-set holds** — `hold : lcmd + lctrl + lalt + lshift` holds several modifiers at once, so a key can tap as one thing and hold as a hyper key that every app sees as a real chord.
 - **`.device <alias> { vendor: 0x…, product: 0x… }`** — scope rules to a specific keyboard, so one config does the right thing on each machine.
 
 **Install** via Homebrew, or download the `.app` bundle from GitHub releases:
@@ -237,6 +238,7 @@ The service will:
 - **Mode activation with command**: Execute a command when switching modes (e.g., `cmd - w ; window : echo "Window mode"`)
 - **`.device` + `.remap` (v0.1.0)**: per-device HID-layer remapping, both colon (1:1) and block (tap/hold) forms.
 - **Layer holds (v0.1.0)**: a `.remap` `hold:` target can be a skhd mode, so holding a key activates a layer for the duration of the hold.
+- **Modifier-set holds**: a `.remap` `hold:` target can be several modifiers joined with `+`, held together for a hyper key.
 
 ### Command-Line Interface
 
@@ -281,6 +283,7 @@ The service will:
 - **Comprehensive error reporting**: Detailed error messages with line numbers
 - **Per-device HID remapping**: colon-form `.remap` for instant 1:1 swaps, block-form for tap-vs-hold semantics
 - **Layer holds**: `hold:` can target a skhd mode instead of a key, so holding the source key activates a layer
+- **Modifier-set holds**: `hold:` can be several modifiers joined with `+` (e.g. a hyper key)
 - **DriverKit injection**: caps_lock-class keys (and modifier-as-hold rules) routed through `skhd-grabber` + Karabiner DriverKit, sidestepping limits of the user-session event tap
 
 ### Build Commands
@@ -671,6 +674,14 @@ hidutil can't do tap vs. hold.
     timeout         : 200ms
     permissive_hold : on
     retro_tap       : on
+}
+
+# Hyper key on a second keyboard: tap = escape, hold = cmd+ctrl+alt+shift
+# together. `skhd --list-devices` prints the .device line for each keyboard.
+.device external { vendor: 0x046D, product: 0xC548 }
+.remap caps_lock [device external] {
+    tap  : escape
+    hold : lcmd + lctrl + lalt + lshift
 }
 ```
 

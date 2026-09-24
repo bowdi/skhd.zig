@@ -745,7 +745,7 @@ const Daemon = struct {
 
         log.info("apply_rules: {d} rule(s), {d} remap(s) across {d} device(s) layer_push={}", .{ rules.len, remaps.len, matches.items.len, has_layer_rule });
         for (rules, 0..) |rule, i| {
-            const hold_str: []const u8 = if (rule.hold_layer) |l| l else "<hid_usage>";
+            const hold_str: []const u8 = if (rule.hold_layer) |l| l else if (rule.hold_modifiers != 0) "<modifiers>" else "<hid_usage>";
             log.info(
                 "  rule[{d}]: src=0x{X:0>2} tap=0x{X:0>2} hold={s} timeout={d}ms perm={} hokp={}",
                 .{ i, rule.src_usage, rule.tap_usage, hold_str, rule.timeout_ms, rule.permissive_hold, rule.hold_on_other_key_press },
@@ -801,9 +801,12 @@ const Daemon = struct {
         errdefer self.allocator.free(slots);
 
         for (rules, 0..) |rule, i| {
-            const hold_action: TapHold.HoldAction = if (rule.hold_layer) |layer_name| .{ .layer = layer_name } else .{
-                .hid_usage = std.math.cast(u16, rule.hold_usage) orelse return error.HoldUsageOverflow,
-            };
+            const hold_action: TapHold.HoldAction = if (rule.hold_layer) |layer_name|
+                .{ .layer = layer_name }
+            else if (rule.hold_modifiers != 0)
+                .{ .modifiers = rule.hold_modifiers }
+            else
+                .{ .hid_usage = std.math.cast(u16, rule.hold_usage) orelse return error.HoldUsageOverflow };
             const th_rule: TapHold.Rule = .{
                 .src_usage = std.math.cast(u16, rule.src_usage) orelse return error.SourceUsageOverflow,
                 .tap_usage = std.math.cast(u16, rule.tap_usage) orelse return error.TapUsageOverflow,
@@ -2099,6 +2102,7 @@ fn seizeTest(
     if (rule) |r| {
         const hold_str: []const u8 = switch (r.hold) {
             .hid_usage => "<hid_usage>",
+            .modifiers => "<modifiers>",
             .layer => |n| n,
         };
         log.info(

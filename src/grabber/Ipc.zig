@@ -167,8 +167,8 @@ fn handleApplyRules(
     log.info("apply_rules uid={d} rules={d} remaps={d} fkeys_as_standard={}", .{ uid, rules.len, remaps.len, fkeys_as_standard });
     for (rules, 0..) |r, i| {
         log.info(
-            "  rule[{d}]: src=0x{X:0>2} tap=0x{X:0>2} hold=0x{X:0>2} timeout={d}ms perm={} hokp={} retro={}",
-            .{ i, r.src_usage, r.tap_usage, r.hold_usage, r.timeout_ms, r.permissive_hold, r.hold_on_other_key_press, r.retro_tap },
+            "  rule[{d}]: src=0x{X:0>2} tap=0x{X:0>2} hold=0x{X:0>2} mods=0b{b:0>8} timeout={d}ms perm={} hokp={} retro={}",
+            .{ i, r.src_usage, r.tap_usage, r.hold_usage, r.hold_modifiers, r.timeout_ms, r.permissive_hold, r.hold_on_other_key_press, r.retro_tap },
         );
         if (r.device) |d| {
             log.info("    device: vendor=0x{X:0>4} product=0x{X:0>4}", .{ d.vendor, d.product });

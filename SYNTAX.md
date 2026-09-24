@@ -345,12 +345,16 @@ device_attrs    = 'vendor:' <hex>  ',' 'product:' <hex>
 device_clause   = '[' 'device' <identifier> ']'
 taphold_attrs   = ( <taphold_attr> )+
 taphold_attr    = 'tap'                ':' <hid_key>
-                | 'hold'               ':' <hid_key_or_layer>
+                | 'hold'               ':' <hold_target>
                 | 'timeout'            ':' <duration>
                 | 'permissive_hold'    ':' ('on' | 'off')
                 | 'hold_on_other_key_press' ':' ('on' | 'off')
                 | 'retro_tap'          ':' ('on' | 'off')
-hid_key_or_layer = <hid_key> | <mode_identifier>   // mode = layer hold
+hold_target      = <hid_key>
+                 | <modifier> ( '+' <modifier> )+  // held together
+                 | <mode_identifier>               // mode = layer hold
+modifier         = 'lctrl' | 'lshift' | 'lalt' | 'lcmd'
+                 | 'rctrl' | 'rshift' | 'ralt' | 'rcmd'
 duration         = <integer> ('ms' | 's')?   // bare integer = milliseconds.
                                              // The unit must be on the same
                                              // line as the integer.
@@ -558,11 +562,31 @@ JSON dialect — skhd users want a config that reads like the rest of
 | Attribute | Type | Default | QMK equivalent | Description |
 |---|---|---|---|---|
 | `tap` | hid_key | required | `LT(layer, kc)` tap behavior | Key emitted on a quick tap (press + release within `timeout`). |
-| `hold` | hid_key or mode | required | `LT(layer, kc)` hold behavior | Key emitted while held past `timeout`. A mode identifier here makes it a **layer hold** (see below). |
+| `hold` | hid_key, modifier set or mode | required | `LT(layer, kc)` hold behavior | Key emitted while held past `timeout`. Modifiers joined with `+` are held together (see **modifier-set holds**). A mode identifier makes it a **layer hold** (see below). |
 | `timeout` | duration | `200ms` | [`TAPPING_TERM`](https://github.com/qmk/qmk_firmware/blob/master/docs/tap_hold.md#tapping-term) | How long the source key has to be held to commit the hold action. |
 | `permissive_hold` | `on`/`off` | `on` | [`PERMISSIVE_HOLD`](https://github.com/qmk/qmk_firmware/blob/master/docs/tap_hold.md#permissive-hold) | If `on`, a nested down+up of another key while the source is held also commits the hold modifier. Useful for typing Ctrl+A by holding caps for ~50ms then quickly tapping `a`. |
 | `hold_on_other_key_press` | `on`/`off` | `off` | [`HOLD_ON_OTHER_KEY_PRESS`](https://github.com/qmk/qmk_firmware/blob/master/docs/tap_hold.md#hold-on-other-key-press) | If `on`, any other key pressed (even without release) while the source is held immediately commits the hold action. Stricter than `permissive_hold`. |
 | `retro_tap` | `on`/`off` | `off` | [`RETRO_TAPPING`](https://github.com/qmk/qmk_firmware/blob/master/docs/tap_hold.md#retro-tapping) | If `on`, releasing the source key without committing a hold still emits the tap key. Useful for over-held keys (e.g. holding `space` then releasing without pressing anything else still types a space). |
+
+### Modifier-Set Holds
+
+Join modifiers with `+` to hold several at once. The usual case is a
+hyper key: tap for one key, hold for cmd+ctrl+alt+shift, so every
+application sees a real four-modifier chord.
+
+```bash
+.remap caps_lock [device builtin] {
+    tap  : escape
+    hold : lcmd + lctrl + lalt + lshift
+}
+
+# Bind hyper chords as usual.
+hyper - t : open -a Terminal
+```
+
+Only modifiers combine. A non-modifier in the set (`lcmd + a`) is a
+parse error, because holding an ordinary key for the length of the hold
+is a different feature.
 
 ### Layer Holds
 

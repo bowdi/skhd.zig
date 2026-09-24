@@ -60,8 +60,13 @@ pub const TapHoldDecl = struct {
     /// escape).
     tap_usage: u32,
     /// HID usage byte of the action committed on hold (e.g., lctrl).
-    /// Zero when `hold_layer` is set instead.
+    /// Zero when `hold_modifiers` or `hold_layer` is set instead.
     hold_usage: u32 = 0,
+    /// Modifier usages committed together on hold, as a bitmask where
+    /// bit i is usage 0xE0 + i. Used for a hyper-style hold such as
+    /// `hold : lcmd + lctrl + lalt + lshift`. Zero when another hold
+    /// form is used.
+    hold_modifiers: u8 = 0,
     /// Mode name to push on hold (e.g. "fn_layer"). null when this
     /// rule's hold action is a HID usage. Owned by Mappings (duped
     /// on insert, freed in deinit).

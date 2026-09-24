@@ -325,6 +325,7 @@ fn forwardTapholdsToGrabber(self: *Skhd) !void {
             .src_usage = th.src_usage,
             .tap_usage = th.tap_usage,
             .hold_usage = th.hold_usage,
+            .hold_modifiers = th.hold_modifiers,
             .hold_layer = th.hold_layer,
             .device = .{ .vendor = alias.vendor, .product = alias.product },
             .timeout_ms = th.timeout_ms,
