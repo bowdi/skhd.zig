@@ -919,37 +919,13 @@ const Daemon = struct {
     fn schedulePostWakeVerify(self: *Daemon) void {
         self.stopPostWakeVerify();
         if (self.post_wake_attempt >= post_wake_verify_gaps_s.len) return;
-        var ctx: c.CFRunLoopTimerContext = .{
-            .version = 0,
-            .info = self,
-            .retain = null,
-            .release = null,
-            .copyDescription = null,
-        };
-        const fire_at = c.CFAbsoluteTimeGetCurrent() + post_wake_verify_gaps_s[self.post_wake_attempt];
-        const timer = c.CFRunLoopTimerCreate(
-            c.kCFAllocatorDefault,
-            fire_at,
-            0, // one-shot
-            0,
-            0,
-            postWakeVerifyCallback,
-            &ctx,
-        );
-        if (timer == null) {
+        if (!armOneShot(&self.post_wake_timer, post_wake_verify_gaps_s[self.post_wake_attempt], postWakeVerifyCallback, self)) {
             log.warn("post-wake verify timer create failed; a dead wake seize won't self-heal", .{});
-            return;
         }
-        self.post_wake_timer = timer;
-        c.CFRunLoopAddTimer(c.CFRunLoopGetCurrent(), timer, c.kCFRunLoopDefaultMode);
     }
 
     fn stopPostWakeVerify(self: *Daemon) void {
-        if (self.post_wake_timer) |t| {
-            c.CFRunLoopTimerInvalidate(t);
-            c.CFRelease(t);
-            self.post_wake_timer = null;
-        }
+        disarm(&self.post_wake_timer);
     }
 
     /// Entry point from the seize callback when a vhidd send fails.
@@ -1109,38 +1085,13 @@ const Daemon = struct {
     }
 
     fn scheduleVhiddRecovery(self: *Daemon, delay_ms: u32) void {
-        self.cancelVhiddRecoveryTimer();
-        var ctx: c.CFRunLoopTimerContext = .{
-            .version = 0,
-            .info = self,
-            .retain = null,
-            .release = null,
-            .copyDescription = null,
-        };
-        const fire_at = c.CFAbsoluteTimeGetCurrent() + @as(f64, @floatFromInt(delay_ms)) / 1000.0;
-        const timer = c.CFRunLoopTimerCreate(
-            c.kCFAllocatorDefault,
-            fire_at,
-            0, // one-shot
-            0,
-            0,
-            vhiddRecoveryTimerCallback,
-            &ctx,
-        );
-        if (timer == null) {
+        if (!armOneShot(&self.vhidd_recovery_timer, msToSeconds(delay_ms), vhiddRecoveryTimerCallback, self)) {
             log.err("vhidd recovery timer create failed — manual restart required", .{});
-            return;
         }
-        self.vhidd_recovery_timer = timer;
-        c.CFRunLoopAddTimer(c.CFRunLoopGetCurrent(), timer, c.kCFRunLoopDefaultMode);
     }
 
     fn cancelVhiddRecoveryTimer(self: *Daemon) void {
-        if (self.vhidd_recovery_timer) |t| {
-            c.CFRunLoopTimerInvalidate(t);
-            c.CFRelease(t);
-            self.vhidd_recovery_timer = null;
-        }
+        disarm(&self.vhidd_recovery_timer);
     }
 
     /// Body of the recovery timer callback. Release seize (so real
@@ -1174,6 +1125,31 @@ const Daemon = struct {
     }
 };
 
+
+/// Arm a one-shot timer on the current run loop into `slot`, replacing any
+/// timer already there. False when CF can't create it.
+fn armOneShot(slot: *c.CFRunLoopTimerRef, delay_s: f64, callback: c.CFRunLoopTimerCallBack, info: *anyopaque) bool {
+    disarm(slot);
+    var ctx: c.CFRunLoopTimerContext = .{ .info = info };
+    const timer = c.CFRunLoopTimerCreate(c.kCFAllocatorDefault, c.CFAbsoluteTimeGetCurrent() + delay_s, 0, 0, 0, callback, &ctx);
+    if (timer == null) return false;
+    slot.* = timer;
+    c.CFRunLoopAddTimer(c.CFRunLoopGetCurrent(), timer, c.kCFRunLoopDefaultMode);
+    return true;
+}
+
+/// Invalidate and release the timer in `slot`, if any. Also what a one-shot
+/// callback calls first, so a re-arm from inside it starts clean.
+fn disarm(slot: *c.CFRunLoopTimerRef) void {
+    const t = slot.* orelse return;
+    c.CFRunLoopTimerInvalidate(t);
+    c.CFRelease(t);
+    slot.* = null;
+}
+
+fn msToSeconds(ms: u32) f64 {
+    return @as(f64, @floatFromInt(ms)) / 1000.0;
+}
 
 fn consoleUserTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
     const d: *Daemon = @ptrCast(@alignCast(info orelse return));
@@ -1289,11 +1265,7 @@ fn onSystemWake(ctx: ?*anyopaque) void {
 fn postWakeVerifyCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(.c) void {
     const d: *Daemon = @ptrCast(@alignCast(info orelse return));
     // One-shot: release this timer before doing work.
-    if (d.post_wake_timer) |t| {
-        c.CFRunLoopTimerInvalidate(t);
-        c.CFRelease(t);
-        d.post_wake_timer = null;
-    }
+    disarm(&d.post_wake_timer);
     if (d.sleeping or d.seize == null) return; // slept again / nothing seized
 
     if (d.seize_ctx.input_seen) {
@@ -1320,11 +1292,7 @@ fn vhiddRecoveryTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callcon
     const d: *Daemon = @ptrCast(@alignCast(info orelse return));
     // The timer is one-shot — release its ref before doing work so a
     // re-schedule from attemptVhiddRecovery doesn't fight with it.
-    if (d.vhidd_recovery_timer) |t| {
-        c.CFRunLoopTimerInvalidate(t);
-        c.CFRelease(t);
-        d.vhidd_recovery_timer = null;
-    }
+    disarm(&d.vhidd_recovery_timer);
     d.attemptVhiddRecovery();
 }
 
