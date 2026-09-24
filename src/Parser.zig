@@ -1542,6 +1542,7 @@ fn parse_remap_decl(self: *Parser, mappings: *Mappings) !void {
 fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, src_usage: u32, alias_name: []const u8) !void {
     var tap_usage: ?u32 = null;
     var hold_usage: ?u32 = null;
+    var hold_modifiers: u8 = 0;
     var hold_target_text: []const u8 = "";
     var timeout_ms: u32 = 200;
     var permissive_hold: bool = true;
@@ -1579,7 +1580,20 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
                 self.advance();
                 break :blk null;
             };
-            if (hold_usage != null) self.advance();
+            if (hold_usage != null) {
+                self.advance();
+                // `hold : lcmd + lctrl + …` holds several modifiers at
+                // once, which is how a hyper key is expressed. Only
+                // modifiers combine: any other key is a single usage,
+                // because the HID report has one modifier byte but
+                // carries ordinary keys in slots the tap-hold engine
+                // doesn't own.
+                if (self.peek_check(.Token_Plus)) {
+                    hold_modifiers = try self.parse_hold_modifier_set(hold_usage.?, peeked);
+                    hold_usage = null;
+                    hold_target_text = "";
+                }
+            }
         } else if (std.mem.eql(u8, field, "timeout")) {
             timeout_ms = try self.parse_duration_ms();
         } else if (std.mem.eql(u8, field, "permissive_hold")) {
@@ -1603,7 +1617,7 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
         return error.ParseErrorOccurred;
     }
     var hold_layer: ?[]const u8 = null;
-    if (hold_usage == null) {
+    if (hold_usage == null and hold_modifiers == 0) {
         // Layer-hold case: `hold : <mode_name>` instead of a HID key.
         // Look up the name in the mode_map; if it's not a known mode,
         // surface a real error.
@@ -1618,6 +1632,7 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
         .src_usage = src_usage,
         .tap_usage = tap_usage.?,
         .hold_usage = hold_usage orelse 0,
+        .hold_modifiers = hold_modifiers,
         .hold_layer = hold_layer,
         .device_alias = alias_name,
         .timeout_ms = timeout_ms,
@@ -1633,6 +1648,44 @@ fn parse_remap_block_body(self: *Parser, mappings: *Mappings, src_token: Token, 
         }
         return err;
     };
+}
+
+/// Fold `mod + mod + …` into a bitmask where bit i is usage 0xE0 + i,
+/// which is the layout the grabber's HID report already uses.
+/// `first_usage` is the modifier the caller has already consumed; the
+/// next token is the `+` that made this a chord rather than one key.
+///
+/// Only modifiers combine. Mixing in an ordinary key would need the
+/// engine to hold a key slot in the report for as long as the hold
+/// lasts, which is a different feature from a hyper key.
+fn parse_hold_modifier_set(self: *Parser, first_usage: u32, first_token: Token) !u8 {
+    var mask: u8 = try self.modifier_bit(first_usage, first_token);
+
+    while (self.match(.Token_Plus)) {
+        const token = self.peek() orelse self.previous();
+        const usage = HidKeyMap.lookup(token.text) orelse {
+            const msg = try std.fmt.allocPrint(self.allocator, "Unknown modifier '{s}' after '+' in 'hold'", .{token.text});
+            defer self.allocator.free(msg);
+            self.error_info = try ParseError.fromToken(self.allocator, token, msg, self.current_file_path);
+            return error.ParseErrorOccurred;
+        };
+        self.advance();
+        mask |= try self.modifier_bit(usage, token);
+    }
+
+    return mask;
+}
+
+/// The single bit standing for one page-7 modifier usage (0xE0…0xE7).
+fn modifier_bit(self: *Parser, usage: u32, token: Token) !u8 {
+    if (usage < 0xE0 or usage > 0xE7) {
+        const msg = try std.fmt.allocPrint(self.allocator, "'{s}' is not a modifier, and only modifiers can be joined with '+' in 'hold'", .{token.text});
+        defer self.allocator.free(msg);
+        self.error_info = try ParseError.fromToken(self.allocator, token, msg, self.current_file_path);
+        return error.ParseErrorOccurred;
+    }
+    const shift: u3 = @intCast(usage - 0xE0);
+    return @as(u8, 1) << shift;
 }
 
 fn parse_keysym_value(self: *Parser) !u32 {
@@ -2451,6 +2504,73 @@ test "tap-hold timeout accepts ms and s suffixes" {
     try std.testing.expectEqual(@as(usize, 2), mappings.tapholds.items.len);
     try std.testing.expectEqual(@as(u32, 1000), mappings.tapholds.items[0].timeout_ms);
     try std.testing.expectEqual(@as(u32, 250), mappings.tapholds.items[1].timeout_ms);
+}
+
+test "hold accepts a set of modifiers" {
+    const alloc = std.testing.allocator;
+    var parser = try Parser.init(alloc, std.testing.io);
+    defer parser.deinit();
+    var mappings = try Mappings.init(alloc, std.testing.io);
+    defer mappings.deinit();
+
+    // A hyper key: tap still types its own key, hold presents all four
+    // modifiers so other applications see a real chord.
+    try parser.parse(&mappings,
+        \\.device builtin { vendor: 0x05AC, product: 0x0342 }
+        \\.remap caps_lock [device builtin] {
+        \\    tap  : f18
+        \\    hold : lcmd + lctrl + lalt + lshift
+        \\}
+    );
+    try std.testing.expectEqual(@as(usize, 1), mappings.tapholds.items.len);
+    const th = mappings.tapholds.items[0];
+    // lctrl 0xE0 → bit 0, lshift 0xE1 → bit 1, lalt 0xE2 → bit 2,
+    // lcmd 0xE3 → bit 3.
+    try std.testing.expectEqual(@as(u8, 0b0000_1111), th.hold_modifiers);
+    // The single-usage field stays clear so the grabber picks the
+    // modifier-set branch rather than emitting usage 0.
+    try std.testing.expectEqual(@as(u32, 0), th.hold_usage);
+    try std.testing.expectEqual(@as(?[]const u8, null), th.hold_layer);
+}
+
+test "a single modifier hold stays a single usage" {
+    const alloc = std.testing.allocator;
+    var parser = try Parser.init(alloc, std.testing.io);
+    defer parser.deinit();
+    var mappings = try Mappings.init(alloc, std.testing.io);
+    defer mappings.deinit();
+
+    // Regression guard: adding the set form must not reroute the
+    // one-modifier case, which has its own wire field.
+    try parser.parse(&mappings,
+        \\.device builtin { vendor: 0x05AC, product: 0x0342 }
+        \\.remap caps_lock [device builtin] {
+        \\    tap  : escape
+        \\    hold : lctrl
+        \\}
+    );
+    const th = mappings.tapholds.items[0];
+    try std.testing.expectEqual(@as(u32, 0xE0), th.hold_usage);
+    try std.testing.expectEqual(@as(u8, 0), th.hold_modifiers);
+}
+
+test "hold rejects a non-modifier joined with +" {
+    const alloc = std.testing.allocator;
+    var parser = try Parser.init(alloc, std.testing.io);
+    defer parser.deinit();
+    var mappings = try Mappings.init(alloc, std.testing.io);
+    defer mappings.deinit();
+
+    // Holding a modifier together with an ordinary key would mean
+    // owning a key slot in the report for the whole hold, which the
+    // engine doesn't do. Say so rather than dropping the key.
+    try std.testing.expectError(error.ParseErrorOccurred, parser.parse(&mappings,
+        \\.device builtin { vendor: 0x05AC, product: 0x0342 }
+        \\.remap caps_lock [device builtin] {
+        \\    tap  : escape
+        \\    hold : lcmd + a
+        \\}
+    ));
 }
 
 test "duration suffix must be on the same line as the number" {

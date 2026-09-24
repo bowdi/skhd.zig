@@ -42,18 +42,25 @@ pub const Remap = struct {
 ///
 /// Hold action is one of:
 /// - `hold_usage > 0`: emit that HID usage on hold (modifier-style),
+/// - `hold_modifiers > 0`: hold several modifiers together (hyper),
 /// - `hold_layer != null`: switch the agent into that mode while held.
 ///
-/// Exactly one must be set; both forms are mutually exclusive. This
-/// matches `.remap … { hold: <hid-key> | <mode_name> }` in the config.
+/// Exactly one must be set; the forms are mutually exclusive. This
+/// matches `.remap … { hold: <hid-key> | <mods> | <mode_name> }` in
+/// the config.
 pub const Rule = struct {
     /// HID usage of the source key on usage page 0x07 (e.g. 0x39 for
     /// caps_lock).
     src_usage: u32,
     /// HID usage emitted on tap.
     tap_usage: u32,
-    /// HID usage emitted on hold. Zero when `hold_layer` is set.
+    /// HID usage emitted on hold. Zero when `hold_modifiers` or
+    /// `hold_layer` is set.
     hold_usage: u32 = 0,
+    /// Modifier usages held together, as a bitmask where bit i is
+    /// usage 0xE0 + i. Zero when another hold form is used. Defaulted
+    /// so an older agent that never sends the field still parses.
+    hold_modifiers: u8 = 0,
     /// Mode name to push on hold; null when `hold_usage` is set.
     /// Owned by the wire payload's arena (parsed-from-JSON lifetime).
     hold_layer: ?[]const u8 = null,
@@ -111,6 +118,55 @@ test "frame round-trip" {
     var read_buf: [256]u8 = undefined;
     const n = try readFrame(&r, &read_buf);
     try std.testing.expectEqualStrings("hello world", read_buf[0..n]);
+}
+
+test "a modifier-set rule survives the wire round trip" {
+    var pipe_buf: [512]u8 = undefined;
+    var w = std.Io.Writer.fixed(&pipe_buf);
+
+    // 0b1111 = lctrl, lshift, lalt, lcmd held together.
+    try writeMessage(&w, std.testing.allocator, .{
+        .@"type" = "apply_rules",
+        .rules = [_]Rule{.{
+            .src_usage = 0x39,
+            .tap_usage = 0x6D,
+            .hold_modifiers = 0b0000_1111,
+            .device = .{ .vendor = 0x046D, .product = 0xC548 },
+        }},
+    });
+
+    var r = std.Io.Reader.fixed(w.buffered());
+    var read_buf: [512]u8 = undefined;
+    const n = try readFrame(&r, &read_buf);
+
+    const Body = struct { @"type": []const u8, rules: []Rule };
+    var parsed = try std.json.parseFromSlice(Body, std.testing.allocator, read_buf[0..n], .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    const rule = parsed.value.rules[0];
+    try std.testing.expectEqual(@as(u8, 0b0000_1111), rule.hold_modifiers);
+    // The single-usage field must stay clear, because the grabber picks
+    // its hold branch by checking hold_modifiers before hold_usage.
+    try std.testing.expectEqual(@as(u32, 0), rule.hold_usage);
+    try std.testing.expectEqual(@as(?[]const u8, null), rule.hold_layer);
+}
+
+test "a rule from an older agent still parses without the field" {
+    // `ignore_unknown_fields` protects new-agent → old-grabber, and the
+    // default on hold_modifiers protects old-agent → new-grabber. Pin
+    // the second direction so the default is never dropped.
+    const json =
+        \\{"src_usage":57,"tap_usage":41,"hold_usage":224,"timeout_ms":200}
+    ;
+    var parsed = try std.json.parseFromSlice(Rule, std.testing.allocator, json, .{
+        .ignore_unknown_fields = true,
+    });
+    defer parsed.deinit();
+
+    try std.testing.expectEqual(@as(u32, 0xE0), parsed.value.hold_usage);
+    try std.testing.expectEqual(@as(u8, 0), parsed.value.hold_modifiers);
 }
 
 test "writeMessage produces parseable JSON" {

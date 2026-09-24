@@ -41,11 +41,20 @@ pub const HoldAction = union(enum) {
     /// Emit a HID page-7 usage (modifier or any key). Used for
     /// caps_lock → ctrl, etc.
     hid_usage: u16,
+    /// Emit several page-7 modifier usages at once, for a hyper-style
+    /// hold like `caps_lock → cmd+ctrl+alt+shift`. Bit i is usage
+    /// 0xE0 + i, which is Vhidd.Modifier's packed layout, so KbState
+    /// folds the individual transitions back into one modifier byte.
+    modifiers: u8,
     /// Push a named mode onto the agent. Used for layer holds like
     /// `space → fn_layer`. Lifetime: the engine borrows the slice;
     /// caller keeps it valid until the engine is dropped.
     layer: []const u8,
 };
+
+/// Lowest page-7 modifier usage. Bit i of a `modifiers` mask is
+/// `modifier_usage_base + i`.
+pub const modifier_usage_base: u16 = 0xE0;
 
 pub const Rule = struct {
     src_usage: u16,
@@ -377,6 +386,16 @@ fn emitHoldDown(self: *Self) void {
             log.debug("commit hold: src=0x{X:0>2} → hold=0x{X:0>2} down", .{ self.rule.src_usage, u });
             self.emit(u, true);
         },
+        .modifiers => |mask| {
+            log.debug("commit hold: src=0x{X:0>2} → mods=0b{b:0>8} down", .{ self.rule.src_usage, mask });
+            var bit: u3 = 0;
+            while (true) : (bit += 1) {
+                if (mask & (@as(u8, 1) << bit) != 0) {
+                    self.emit(modifier_usage_base + bit, true);
+                }
+                if (bit == 7) break;
+            }
+        },
         .layer => |name| {
             log.debug("commit hold: src=0x{X:0>2} → enter layer '{s}'", .{ self.rule.src_usage, name });
             if (self.layer_sink) |ls| {
@@ -393,6 +412,18 @@ fn emitHoldUp(self: *Self) void {
         .hid_usage => |u| {
             log.debug("commit hold: src=0x{X:0>2} → hold=0x{X:0>2} up", .{ self.rule.src_usage, u });
             self.emit(u, false);
+        },
+        .modifiers => |mask| {
+            log.debug("commit hold: src=0x{X:0>2} → mods=0b{b:0>8} up", .{ self.rule.src_usage, mask });
+            // Released high bit first, mirroring the press order, so a
+            // listener reconstructing the stream sees a clean unwind.
+            var bit: u3 = 7;
+            while (true) : (bit -= 1) {
+                if (mask & (@as(u8, 1) << bit) != 0) {
+                    self.emit(modifier_usage_base + bit, false);
+                }
+                if (bit == 0) break;
+            }
         },
         .layer => |name| {
             log.debug("commit hold: src=0x{X:0>2} → exit layer '{s}'", .{ self.rule.src_usage, name });
@@ -482,6 +513,52 @@ test "hold path: timer fires emits hold_down, source up emits hold_up" {
     try std.testing.expectEqual(@as(usize, 2), sink.out.items.len);
     try std.testing.expectEqual(@as(u32, 0xE0), sink.out.items[1].usage);
     try std.testing.expect(!sink.out.items[1].pressed);
+}
+
+test "hold path: a modifier set presses every modifier and releases them" {
+    var sink = TestSink.init(std.testing.allocator);
+    defer sink.deinit();
+    // 0b1111 = lctrl, lshift, lalt, lcmd — a hyper key.
+    var eng = init(
+        .{ .src_usage = 0x39, .tap_usage = 0x29, .hold = .{ .modifiers = 0b0000_1111 } },
+        TestSink.callback,
+        &sink,
+    );
+
+    _ = eng.feed(kbev(0x39, true));
+    _ = eng.timerFired();
+    try std.testing.expectEqual(@as(usize, 4), sink.out.items.len);
+    for (sink.out.items, 0..) |ev, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(0xE0 + i)), ev.usage);
+        try std.testing.expect(ev.pressed);
+    }
+
+    const r = eng.feed(kbev(0x39, false));
+    try std.testing.expectEqual(Disposition.consumed, r.disposition);
+    try std.testing.expectEqual(@as(usize, 8), sink.out.items.len);
+    // Released in reverse, so the stream unwinds the way it was built.
+    for (sink.out.items[4..], 0..) |ev, i| {
+        try std.testing.expectEqual(@as(u32, @intCast(0xE3 - i)), ev.usage);
+        try std.testing.expect(!ev.pressed);
+    }
+}
+
+test "tap path: a modifier-set rule still taps its tap usage" {
+    var sink = TestSink.init(std.testing.allocator);
+    defer sink.deinit();
+    var eng = init(
+        .{ .src_usage = 0x39, .tap_usage = 0x29, .hold = .{ .modifiers = 0b0000_1111 } },
+        TestSink.callback,
+        &sink,
+    );
+
+    // A quick tap must not leak any modifier: a tap types only its tap
+    // key, with no modifier held around it.
+    _ = eng.feed(kbev(0x39, true));
+    _ = eng.feed(kbev(0x39, false));
+    try std.testing.expectEqual(@as(usize, 2), sink.out.items.len);
+    try std.testing.expectEqual(@as(u32, 0x29), sink.out.items[0].usage);
+    try std.testing.expectEqual(@as(u32, 0x29), sink.out.items[1].usage);
 }
 
 test "default: other key passes through during pending without committing" {
