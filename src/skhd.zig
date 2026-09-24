@@ -469,6 +469,35 @@ fn grabberDisconnected(ctx: ?*anyopaque) void {
     self.scheduleGrabberReconnect();
 }
 
+/// Replace the grabber subscription with one built from the current
+/// mappings and connected devices.
+fn reforwardToGrabber(self: *Skhd) !void {
+    // Tear down the previous grabber connection so forwardTapholds...
+    // can dial fresh with the current rules. Do this even when the
+    // new config has no caps-class rules — closing the old socket
+    // is how the grabber learns we don't want our previous rules
+    // applied any more.
+    //
+    // No `bye` here: once apply_rules has succeeded, the grabber moves
+    // this socket out of `Ipc.serve` and into its subscriptionCallback,
+    // which only PEEKs for EOS and discards any frame the agent writes
+    // as "stray bytes". A bye on a subscription connection therefore
+    // never gets a reply — and worse, an `expectOk` read after it can
+    // pick up a queued `mode_change` push (logged as "unexpected type:
+    // mode_change") or block indefinitely. EOS-on-close is the only
+    // teardown signal the subscription path actually honors.
+    if (self.layer_listener) |ll| {
+        ll.deinit();
+        self.layer_listener = null;
+    }
+    if (self.grabber_client) |gc| {
+        gc.close();
+        self.allocator.destroy(gc);
+        self.grabber_client = null;
+    }
+    try self.forwardTapholdsToGrabber();
+}
+
 fn scheduleGrabberReconnect(self: *Skhd) void {
     if (self.grabber_reconnect_timer != null) return;
     var ctx = c.CFRunLoopTimerContext{
@@ -1637,30 +1666,7 @@ pub fn reloadConfig(self: *Skhd) !void {
         }
     }
 
-    // Tear down the previous grabber connection so forwardTapholds...
-    // can dial fresh with the updated rules. Do this even when the
-    // new config has no caps-class rules — closing the old socket
-    // is how the grabber learns we don't want our previous rules
-    // applied any more.
-    //
-    // No `bye` here: once apply_rules has succeeded, the grabber moves
-    // this socket out of `Ipc.serve` and into its subscriptionCallback,
-    // which only PEEKs for EOS and discards any frame the agent writes
-    // as "stray bytes". A bye on a subscription connection therefore
-    // never gets a reply — and worse, an `expectOk` read after it can
-    // pick up a queued `mode_change` push (logged as "unexpected type:
-    // mode_change") or block indefinitely. EOS-on-close is the only
-    // teardown signal the subscription path actually honors.
-    if (self.layer_listener) |ll| {
-        ll.deinit();
-        self.layer_listener = null;
-    }
-    if (self.grabber_client) |gc| {
-        gc.close();
-        self.allocator.destroy(gc);
-        self.grabber_client = null;
-    }
-    self.forwardTapholdsToGrabber() catch |err| {
+    self.reforwardToGrabber() catch |err| {
         log.warn("hot reload: could not forward updated rules to skhd-grabber: {s}", .{@errorName(err)});
     };
 
