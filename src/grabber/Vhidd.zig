@@ -373,11 +373,39 @@ pub const Client = struct {
         if (body.len + 1 > buf.len) return error.PayloadTooLarge;
         buf[0] = @intFromEnum(FrameType.user_data);
         @memcpy(buf[1..][0..body.len], body);
-        const sent = std.c.send(self.fd, buf[0 .. body.len + 1].ptr, body.len + 1, 0);
-        if (sent < 0) return error.SendFailed;
-        if (@as(usize, @intCast(sent)) != body.len + 1) return error.ShortWrite;
+        const frame = buf[0 .. body.len + 1];
+
+        var retries: u32 = 0;
+        while (true) {
+            const sent = std.c.send(self.fd, frame.ptr, frame.len, 0);
+            if (sent >= 0) {
+                if (@as(usize, @intCast(sent)) != frame.len) return error.ShortWrite;
+                if (retries > 0) log.debug("send went through after {d} retries", .{retries});
+                return;
+            }
+            // Darwin fails a Unix datagram send at once with ENOBUFS when
+            // the server's receive buffer is full, rather than blocking.
+            // That is the server falling behind for a moment, not a dead
+            // transport: a hyper hold alone posts several reports back to
+            // back. Wait for it to drain so no report is lost and the
+            // caller never tears down the seize over a burst.
+            const err = std.c.errno(sent);
+            if ((err != .NOBUFS and err != .AGAIN) or retries == max_send_retries) {
+                log.warn("send failed: errno={s} after {d} retries", .{ @tagName(err), retries });
+                return error.SendFailed;
+            }
+            retries += 1;
+            const pause: std.c.timespec = .{ .sec = 0, .nsec = send_retry_pause_ns };
+            _ = std.c.nanosleep(&pause, null);
+        }
     }
 };
+
+/// Bounds the wait for a full vhidd receive buffer to drain: 20 × 250µs
+/// is 5ms, long enough for the server to catch up after a burst and
+/// short enough that a wedged server still reaches recovery promptly.
+const max_send_retries: u32 = 20;
+const send_retry_pause_ns = 250 * std.time.ns_per_us;
 
 fn encodeHeader(buf: []u8, req: Request) usize {
     buf[0] = magic[0];
@@ -552,4 +580,64 @@ test "parseFrame: empty, header-only, and unknown types are .other" {
     try std.testing.expectEqual(Frame.other, parseFrame(&.{}));
     try std.testing.expectEqual(Frame.other, parseFrame(&.{1})); // user_data, no response byte
     try std.testing.expectEqual(Frame.other, parseFrame(&.{ 9, 1, 2 })); // unknown envelope type
+}
+
+/// Test fixture: a connected Unix datagram pair whose receive side is
+/// full, the state vhidd's server socket is in when it falls behind.
+const FullSocketPair = struct {
+    fds: [2]std.c.fd_t,
+
+    fn init() !FullSocketPair {
+        var fds: [2]std.c.fd_t = undefined;
+        if (std.c.socketpair(std.c.AF.UNIX, std.c.SOCK.DGRAM, 0, &fds) != 0) return error.SocketPairFailed;
+        const filler: [74]u8 = @splat(0);
+        while (true) {
+            const r = std.c.send(fds[0], &filler, filler.len, 0);
+            if (r >= 0) continue;
+            if (std.c.errno(r) != .NOBUFS) return error.UnexpectedErrno;
+            break;
+        }
+        return .{ .fds = fds };
+    }
+
+    fn deinit(self: FullSocketPair) void {
+        _ = std.c.close(self.fds[0]);
+        _ = std.c.close(self.fds[1]);
+    }
+
+    fn client(self: FullSocketPair) Client {
+        return .{ .allocator = std.testing.allocator, .fd = self.fds[0], .bound_path = undefined };
+    }
+
+    /// Reads one datagram after `delay_ns`, as the server would once it
+    /// catches up.
+    fn drainOneAfter(fd: std.c.fd_t, delay_ns: u64) void {
+        const pause: std.c.timespec = .{ .sec = 0, .nsec = @intCast(delay_ns) };
+        _ = std.c.nanosleep(&pause, null);
+        var sink: [128]u8 = undefined;
+        _ = std.c.recv(fd, &sink, sink.len, 0);
+    }
+};
+
+test "a send into a full receive buffer waits for it to drain" {
+    const pair = try FullSocketPair.init();
+    defer pair.deinit();
+    var c = pair.client();
+
+    // Regression: ENOBUFS used to surface as SendFailed at once, which
+    // the grabber treats as a dead transport and tears the seize down
+    // mid-hold, leaving the hold's modifiers stuck.
+    const drainer = try std.Thread.spawn(.{}, FullSocketPair.drainOneAfter, .{ pair.fds[1], std.time.ns_per_ms });
+    defer drainer.join();
+
+    try c.postKeyboardReport(.{ .left_command = true }, &.{});
+}
+
+test "a send into a buffer that never drains still fails" {
+    const pair = try FullSocketPair.init();
+    defer pair.deinit();
+    var c = pair.client();
+
+    // A wedged server must still reach the caller's recovery path.
+    try std.testing.expectError(error.SendFailed, c.postKeyboardReport(.{}, &.{}));
 }
