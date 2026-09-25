@@ -1225,9 +1225,14 @@ fn consoleUserTimerCallback(_: c.CFRunLoopTimerRef, info: ?*anyopaque) callconv(
 /// teardown is safe — same context as the console-user and power
 /// callbacks. Re-seizing does not itself re-enumerate the device, so
 /// there is no feedback loop.
-fn onDeviceChange(ctx: ?*anyopaque, _: DeviceNotify.Change) void {
+fn onDeviceChange(ctx: ?*anyopaque, change: DeviceNotify.Change) void {
     const d: *Daemon = @ptrCast(@alignCast(ctx orelse return));
     if (d.sleeping) return; // seize stays released until wake
+    // Our own vhidd keyboard appearing or going away is a side effect of
+    // a vhidd reconnect, which already re-seized. Re-seizing on it too
+    // releases the keyboard twice more for no gain.
+    const vk: Vhidd.KeyboardParameters = .{};
+    if (change.isOnly(@intCast(vk.vendor_id), @intCast(vk.product_id))) return;
     // Gate on wanting a seize, not on having one: a failed rebuild leaves
     // `seize` null, and a device change is the best moment to retry it.
     if (d.activeSubscription() == null) return; // no rules yet → first apply_rules will

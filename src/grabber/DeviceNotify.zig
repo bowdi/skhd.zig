@@ -57,6 +57,16 @@ pub const Change = struct {
     overflowed: bool,
 
     pub const Kind = enum { matched, terminated };
+
+    /// Whether every service in the batch is `vendor`/`product`. False
+    /// for an empty or overflowed batch, whose full contents are unknown.
+    pub fn isOnly(self: Change, vendor: u32, product: u32) bool {
+        if (self.devices.len == 0 or self.overflowed) return false;
+        for (self.devices) |d| {
+            if (d.vendor != vendor or d.product != product) return false;
+        }
+        return true;
+    }
 };
 
 allocator: std.mem.Allocator,
@@ -277,4 +287,23 @@ test "live: drain reads connected keyboards' vendor, product and built-in" {
         if (d.built_in) try std.testing.expectEqual(@as(u32, 0), d.vendor);
     }
     try std.testing.expect(change.devices.len > 0);
+}
+
+test "isOnly: true only when every service in a complete batch matches" {
+    const virtual: Device = .{ .vendor = 0x16C0, .product = 0x27DB, .built_in = false };
+    const receiver: Device = .{ .vendor = 0x046D, .product = 0xC548, .built_in = false };
+
+    const only_virtual: Change = .{ .kind = .matched, .devices = &.{ virtual, virtual }, .overflowed = false };
+    try std.testing.expect(only_virtual.isOnly(0x16C0, 0x27DB));
+
+    // A real keyboard in the same batch must still trigger a re-seize.
+    const mixed: Change = .{ .kind = .matched, .devices = &.{ virtual, receiver }, .overflowed = false };
+    try std.testing.expect(!mixed.isOnly(0x16C0, 0x27DB));
+
+    // Services past max_batch are unseen, so they might be anything.
+    const overflowed: Change = .{ .kind = .matched, .devices = &.{virtual}, .overflowed = true };
+    try std.testing.expect(!overflowed.isOnly(0x16C0, 0x27DB));
+
+    const empty: Change = .{ .kind = .terminated, .devices = &.{}, .overflowed = false };
+    try std.testing.expect(!empty.isOnly(0x16C0, 0x27DB));
 }
