@@ -1754,7 +1754,12 @@ fn emitToVhidd(ctx_ptr: ?*anyopaque, ev: TapHold.Event) void {
     if (!cx.state.applyKeyboardEvent(usage16, ev.pressed)) return;
 
     log.debug("emit: usage=0x{X:0>2} pressed={}", .{ usage16, ev.pressed });
+    postKeyboardState(cx, usage16, ev.pressed);
+}
 
+/// Post KbState's current snapshot to vhidd. `usage` and `pressed`
+/// name the change being posted, for the profile trace only.
+fn postKeyboardState(cx: *SeizeCtx, usage: u16, pressed: bool) void {
     // Short-circuit if a previous post already triggered recovery —
     // the seize tear-down is scheduled on the runloop and any events
     // already in flight would otherwise spam the log.
@@ -1773,7 +1778,7 @@ fn emitToVhidd(ctx_ptr: ?*anyopaque, ev: TapHold.Event) void {
         if (cx.profile) {
             const t_post = cx.profile_timer.read();
             std.debug.print("[prof] vhidd-post t={d}us cost={d}us usage=0x{X:0>2} pressed={}\n", .{
-                t_post / std.time.ns_per_us, (t_post - t_pre) / std.time.ns_per_us, usage16, ev.pressed,
+                t_post / std.time.ns_per_us, (t_post - t_pre) / std.time.ns_per_us, usage, pressed,
             });
         }
     }
