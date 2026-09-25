@@ -888,6 +888,11 @@ const Daemon = struct {
         self.seize_ctx.caps_remap_active = false;
         self.seize_ctx.remap_table = @splat(0);
         // Drop any virtual keys we left held so a re-apply starts clean.
+        // The keyboard state matters most: the slots above are freed
+        // without emitting their hold-up, so a hold committed at
+        // teardown would otherwise stay in the modifier byte and be
+        // re-posted with the first keystroke after the re-seize.
+        self.seize_ctx.state.clear();
         self.seize_ctx.consumer_state.clear();
         self.seize_ctx.apple_top_case_state.clear();
         self.seize_ctx.apple_keyboard_state.clear();
