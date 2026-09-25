@@ -81,6 +81,13 @@ pub const TimerAction = union(enum) {
 /// resulting report to vhidd.
 pub const Sink = *const fn (ctx: ?*anyopaque, ev: Event) void;
 
+/// Sink for a `modifiers` hold landing or lifting as one change: `mask`
+/// uses the HoldAction.modifiers layout. Called with `sink_ctx`. Lets
+/// the owner post one report where per-usage emits would post one per
+/// modifier, and a hyper hold's burst of four overran vhidd's receive
+/// buffer.
+pub const ModifierSink = *const fn (ctx: ?*anyopaque, mask: u8, pressed: bool) void;
+
 /// Sink for layer enter/exit events. Called when a layer-hold rule
 /// commits or releases. `entering = true` means push the named layer;
 /// `entering = false` means pop back to the previous mode (the owner
@@ -111,6 +118,9 @@ rule: Rule,
 state: State = .idle,
 sink: Sink,
 sink_ctx: ?*anyopaque,
+/// Optional. When set, a `modifiers` hold goes here as one call instead
+/// of one `sink` event per modifier.
+modifier_sink: ?ModifierSink = null,
 /// Optional layer sink — required if rule.hold is a layer; ignored
 /// otherwise. Owner's responsibility.
 layer_sink: ?LayerSink = null,
@@ -388,6 +398,7 @@ fn emitHoldDown(self: *Self) void {
         },
         .modifiers => |mask| {
             log.debug("commit hold: src=0x{X:0>2} → mods=0b{b:0>8} down", .{ self.rule.src_usage, mask });
+            if (self.modifier_sink) |ms| return ms(self.sink_ctx, mask, true);
             var bit: u3 = 0;
             while (true) : (bit += 1) {
                 if (mask & (@as(u8, 1) << bit) != 0) {
@@ -415,6 +426,7 @@ fn emitHoldUp(self: *Self) void {
         },
         .modifiers => |mask| {
             log.debug("commit hold: src=0x{X:0>2} → mods=0b{b:0>8} up", .{ self.rule.src_usage, mask });
+            if (self.modifier_sink) |ms| return ms(self.sink_ctx, mask, false);
             // Released high bit first, mirroring the press order, so a
             // listener reconstructing the stream sees a clean unwind.
             var bit: u3 = 7;
@@ -541,6 +553,46 @@ test "hold path: a modifier set presses every modifier and releases them" {
         try std.testing.expectEqual(@as(u32, @intCast(0xE3 - i)), ev.usage);
         try std.testing.expect(!ev.pressed);
     }
+}
+
+test "hold path: a modifier sink gets the set as one change each way" {
+    const Recorder = struct {
+        events: TestSink,
+        calls: [4]struct { mask: u8, pressed: bool } = undefined,
+        n: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, ev: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            TestSink.callback(&self.events, ev);
+        }
+
+        fn onModifiers(ctx: ?*anyopaque, mask: u8, pressed: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.calls[self.n] = .{ .mask = mask, .pressed = pressed };
+            self.n += 1;
+        }
+    };
+    var rec: Recorder = .{ .events = TestSink.init(std.testing.allocator) };
+    defer rec.events.deinit();
+    var eng = init(
+        .{ .src_usage = 0x39, .tap_usage = 0x29, .hold = .{ .modifiers = 0b0000_1111 } },
+        Recorder.onEvent,
+        &rec,
+    );
+    eng.modifier_sink = Recorder.onModifiers;
+
+    _ = eng.feed(kbev(0x39, true));
+    _ = eng.timerFired();
+    _ = eng.feed(kbev(0x39, false));
+
+    // One call per edge, not one event per modifier: four back-to-back
+    // posts per edge were enough to overrun vhidd's receive buffer.
+    try std.testing.expectEqual(@as(usize, 2), rec.n);
+    try std.testing.expectEqual(@as(u8, 0b0000_1111), rec.calls[0].mask);
+    try std.testing.expect(rec.calls[0].pressed);
+    try std.testing.expectEqual(@as(u8, 0b0000_1111), rec.calls[1].mask);
+    try std.testing.expect(!rec.calls[1].pressed);
+    try std.testing.expectEqual(@as(usize, 0), rec.events.out.items.len);
 }
 
 test "tap path: a modifier-set rule still taps its tap usage" {

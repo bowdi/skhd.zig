@@ -829,6 +829,7 @@ const Daemon = struct {
             };
             slots[i].engine.arbitration_hook = arbitrateHoldCommit;
             slots[i].engine.arbitration_ctx = &self.seize_ctx;
+            slots[i].engine.modifier_sink = emitModifiersToVhidd;
         }
 
         const seize = try HidSeize.init(self.allocator, seizeInputCallback, &self.seize_ctx);
@@ -1755,6 +1756,22 @@ fn emitToVhidd(ctx_ptr: ?*anyopaque, ev: TapHold.Event) void {
 
     log.debug("emit: usage=0x{X:0>2} pressed={}", .{ usage16, ev.pressed });
     postKeyboardState(cx, usage16, ev.pressed);
+}
+
+/// TapHold modifier sink: fold a whole modifier set into KbState and
+/// post it as one report.
+fn emitModifiersToVhidd(ctx_ptr: ?*anyopaque, mask: u8, pressed: bool) void {
+    const cx: *SeizeCtx = @ptrCast(@alignCast(ctx_ptr orelse return));
+    var changed = false;
+    for (0..8) |i| {
+        if (mask & (@as(u8, 1) << @intCast(i)) == 0) continue;
+        const usage = TapHold.modifier_usage_base + @as(u16, @intCast(i));
+        if (cx.state.applyKeyboardEvent(usage, pressed)) changed = true;
+    }
+    if (!changed) return;
+
+    log.debug("emit: mods=0b{b:0>8} pressed={}", .{ mask, pressed });
+    postKeyboardState(cx, TapHold.modifier_usage_base, pressed);
 }
 
 /// Post KbState's current snapshot to vhidd. `usage` and `pressed`
